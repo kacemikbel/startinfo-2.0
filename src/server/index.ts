@@ -3,6 +3,7 @@ import cors from 'cors';
 import prisma from '../lib/prisma';
 import path from 'path';
 import fs from 'fs/promises';
+import bcrypt from 'bcryptjs';
 
 const app = express();
 const PORT = 5000;
@@ -16,6 +17,22 @@ app.use(cors({
 }));
 
 app.use(express.json());
+
+// Verify database connection on startup
+async function verifyDatabaseConnection() {
+  try {
+    console.log('Verifying database connection...');
+    await prisma.$connect();
+    console.log('Database connection successful');
+    
+    // Test query to verify User table access
+    const userCount = await prisma.user.count();
+    console.log(`Database connection verified. Current user count: ${userCount}`);
+  } catch (error) {
+    console.error('Database connection failed:', error);
+    process.exit(1);
+  }
+}
 
 // Health check endpoint
 app.get('/api/health', (req, res) => {
@@ -378,25 +395,66 @@ app.get('/api/certificates/:id/download', async (req, res) => {
 // Generate certificate when course is completed
 app.post('/api/courses/:courseId/certificate', async (req, res) => {
   try {
-    const userId = 1; // TODO: Get from auth context
+    const userId = 1;
     const courseId = parseInt(req.params.courseId);
 
-    // Check if course is completed
+    console.log('Generating certificate for:', { userId, courseId });
+
+    if (isNaN(courseId)) {
+      console.error('Invalid course ID:', req.params.courseId);
+      return res.status(400).json({ error: 'Invalid course ID' });
+    }
+
+    // First check if the course exists
+    const course = await prisma.course.findUnique({
+      where: { id: courseId }
+    });
+
+    if (!course) {
+      console.error('Course not found:', courseId);
+      return res.status(404).json({ error: 'Course not found' });
+    }
+
+    console.log('Course found:', course);
+
+    // Get all lessons for the course
+    const lessons = await prisma.lesson.findMany({
+      where: { courseId }
+    });
+
+    console.log('Lessons found:', lessons.length);
+
+    if (!lessons.length) {
+      console.error('No lessons found for course:', courseId);
+      return res.status(400).json({ error: 'Course has no lessons' });
+    }
+
+    // Get progress for all lessons
     const progress = await prisma.lessonProgress.findMany({
       where: {
         userId,
-        lesson: {
-          courseId
+        lessonId: {
+          in: lessons.map(lesson => lesson.id)
         }
       }
     });
 
-    const totalLessons = await prisma.lesson.count({
-      where: { courseId }
+    console.log('Lesson progress:', progress);
+
+    // Check if all lessons are completed
+    const allLessonsCompleted = lessons.every(lesson => {
+      const lessonProgress = progress.find(p => p.lessonId === lesson.id);
+      const isCompleted = lessonProgress?.completed;
+      console.log(`Lesson ${lesson.id} completed:`, isCompleted);
+      return isCompleted;
     });
 
-    if (progress.length !== totalLessons || progress.some(p => !p.completed)) {
-      return res.status(400).json({ error: 'Course not completed' });
+    if (!allLessonsCompleted) {
+      console.error('Not all lessons are completed');
+      return res.status(400).json({ 
+        error: 'Course not completed',
+        details: 'Some lessons are not marked as completed'
+      });
     }
 
     // Check if certificate already exists
@@ -408,6 +466,7 @@ app.post('/api/courses/:courseId/certificate', async (req, res) => {
     });
 
     if (existingCertificate) {
+      console.error('Certificate already exists:', existingCertificate);
       return res.status(400).json({ error: 'Certificate already exists' });
     }
 
@@ -416,7 +475,7 @@ app.post('/api/courses/:courseId/certificate', async (req, res) => {
       data: {
         userId,
         courseId,
-        certificateNumber: `CERT-${Date.now()}`,
+        certificateNumber: `CERT-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
         issuedAt: new Date()
       },
       include: {
@@ -424,10 +483,119 @@ app.post('/api/courses/:courseId/certificate', async (req, res) => {
       }
     });
 
+    console.log('Certificate generated successfully:', certificate);
     res.json(certificate);
   } catch (error) {
     console.error('Error generating certificate:', error);
-    res.status(500).json({ error: 'Failed to generate certificate' });
+    res.status(500).json({ 
+      error: 'Failed to generate certificate',
+      details: error instanceof Error ? error.message : 'Unknown error'
+    });
+  }
+});
+
+// User registration endpoint
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    console.log('Received registration request body:', req.body);
+    const { email, password } = req.body;
+
+    console.log('Parsed registration data:', { email });
+
+    // Validate required fields
+    if (!email || !password) {
+      console.error('Missing required fields:', { email: !!email, password: !!password });
+      return res.status(400).json({ error: 'Email and password are required' });
+    }
+
+    // Validate email format
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      console.error('Invalid email format:', email);
+      return res.status(400).json({ error: 'Invalid email format' });
+    }
+
+    // Validate password strength
+    if (password.length < 8) {
+      console.error('Password too short');
+      return res.status(400).json({ error: 'Password must be at least 8 characters long' });
+    }
+
+    // Check if user already exists
+    console.log('Checking if user exists:', email);
+    const existingUser = await prisma.user.findUnique({
+      where: { email }
+    });
+
+    if (existingUser) {
+      console.error('User already exists:', email);
+      return res.status(400).json({ error: 'User with this email already exists' });
+    }
+
+    // Generate a default name from email
+    const defaultName = email.split('@')[0];
+
+    // Hash the password
+    console.log('Hashing password...');
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(password, salt);
+
+    console.log('Attempting to create user with:', {
+      email,
+      name: defaultName,
+      role: 'STUDENT',
+      verified: false
+    });
+
+    try {
+      // Create new user
+      console.log('Creating user in database...');
+      const newUser = await prisma.user.create({
+        data: {
+          email,
+          password: hashedPassword,
+          name: defaultName,
+          role: 'STUDENT', // Default role
+          verified: false,
+          createdAt: new Date(),
+          updatedAt: new Date()
+        }
+      });
+
+      console.log('User created successfully:', { 
+        id: newUser.id, 
+        email: newUser.email,
+        name: newUser.name,
+        role: newUser.role
+      });
+
+      // Return user data (excluding password)
+      const { password: _, ...userWithoutPassword } = newUser;
+      res.status(201).json(userWithoutPassword);
+    } catch (dbError) {
+      console.error('Database error during user creation:', dbError);
+      if (dbError instanceof Error) {
+        console.error('Database error details:', {
+          name: dbError.name,
+          message: dbError.message,
+          stack: dbError.stack
+        });
+      }
+      throw dbError; // Re-throw to be caught by outer try-catch
+    }
+  } catch (error) {
+    console.error('Error registering user:', error);
+    if (error instanceof Error) {
+      console.error('Error details:', {
+        name: error.name,
+        message: error.message,
+        stack: error.stack
+      });
+    }
+    res.status(500).json({ 
+      error: 'Failed to register user',
+      details: error instanceof Error ? error.message : 'Unknown error'
+    });
   }
 });
 
@@ -438,8 +606,9 @@ app.use((err: any, req: express.Request, res: express.Response, next: express.Ne
 });
 
 // Start the server
-const server = app.listen(PORT, () => {
+const server = app.listen(PORT, async () => {
   console.log(`Server running on http://localhost:${PORT}`);
+  await verifyDatabaseConnection();
 });
 
 // Handle server errors
